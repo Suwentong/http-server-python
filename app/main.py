@@ -1,4 +1,5 @@
-import socket  # noqa: F401
+import socket
+import threading
 
 CRLF = "\r\n"
 
@@ -28,42 +29,48 @@ class HTTPResponse:
         return f"{status_line}{headers}{CRLF}{self.body}"
 
 
-def main():
-    # You can use print statements as follows for debugging, they'll be visible when running tests.
-    print("Logs from your program will appear here!")
+def handle_connection(conn: socket.socket):
+    with conn:
+        data = conn.recv(1024).decode("utf-8")
+        if not data:
+            return
+        path = data.splitlines()[0].split()[1]
+        headers = {}
+        for line in data.split(CRLF)[1:]:
+            if not line:
+                break
+            name, separator, value = line.partition(":")
+            if separator:
+                headers[name.lower()] = value.strip(" \t")
+        if path == "/":
+            response = HTTPResponse(200)
+        elif path.startswith("/echo/") or path == "/user-agent":
+            body = (
+                headers.get("user-agent", "")
+                if path == "/user-agent"
+                else path.removeprefix("/echo/")
+            )
+            response = HTTPResponse(
+                200,
+                body=body,
+                headers={
+                    "Content-Type": "text/plain",
+                    "Content-Length": str(len(body.encode("utf-8"))),
+                },
+            )
+        else:
+            response = HTTPResponse(404)
+        conn.sendall(str(response).encode())
 
+
+def main():
     server_socket = socket.create_server(("localhost", 4221), reuse_port=True)
-    while True:
-        conn, addr = server_socket.accept()
-        with conn:
-            data = conn.recv(1024).decode("utf-8")
-            path = data.splitlines()[0].split()[1]
-            headers = {}
-            for line in data.split(CRLF)[1:]:
-                if not line:
-                    break
-                name, separator, value = line.partition(":")
-                if separator:
-                    headers[name.lower()] = value.strip(" \t")
-            if path == "/":
-                response = HTTPResponse(200)
-            elif path.startswith("/echo/") or path == "/user-agent":
-                body = (
-                    headers.get("user-agent", "")
-                    if path == "/user-agent"
-                    else path.removeprefix("/echo/")
-                )
-                response = HTTPResponse(
-                    200,
-                    body=body,
-                    headers={
-                        "Content-Type": "text/plain",
-                        "Content-Length": str(len(body.encode("utf-8"))),
-                    },
-                )
-            else:
-                response = HTTPResponse(404)
-            conn.sendall(str(response).encode())
+    with server_socket:
+        while True:
+            conn, _ = server_socket.accept()
+            threading.Thread(
+                target=handle_connection, args=(conn,), daemon=True
+            ).start()
 
 
 if __name__ == "__main__":
