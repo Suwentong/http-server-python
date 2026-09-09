@@ -38,10 +38,21 @@ def main():
         with conn:
             data = conn.recv(1024).decode("utf-8")
             path = data.splitlines()[0].split()[1]
+            headers = {}
+            for line in data.split(CRLF)[1:]:
+                if not line:
+                    break
+                name, separator, value = line.partition(":")
+                if separator:
+                    headers[name.lower()] = value.strip(" \t")
             if path == "/":
                 response = HTTPResponse(200)
-            elif path.startswith("/echo/"):
-                body = path.removeprefix("/echo/")
+            elif path.startswith("/echo/") or path == "/user-agent":
+                body = (
+                    headers.get("user-agent", "")
+                    if path == "/user-agent"
+                    else path.removeprefix("/echo/")
+                )
                 response = HTTPResponse(
                     200,
                     body=body,
