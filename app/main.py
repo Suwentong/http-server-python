@@ -8,8 +8,10 @@ CRLF = "\r\n"
 
 
 def accepts_gzip(accept_encoding: str) -> bool:
-    # [Stage 9: Accept-Encoding and Content-Encoding]
-    # Codings are comma-separated; parameters such as ";q=1.0" are ignored here.
+    # [Stage 10: Multiple compression schemes]
+    # Accept-Encoding may be one coding or a comma-separated list, such as
+    # "encoding-1, gzip, encoding-2". Stage 9 uses the same check for a single "gzip".
+    # Parameters such as ";q=1.0" are ignored. The server only supports gzip.
     for coding in accept_encoding.split(","):
         if coding.split(";", 1)[0].strip().lower() == "gzip":
             return True
@@ -114,7 +116,8 @@ def handle_connection(conn: socket.socket, directory: Path | None = None):
                 "Content-Length": str(len(body.encode("utf-8"))),
             }
             # [Stage 9: Accept-Encoding and Content-Encoding]
-            # Advertise gzip when the client accepts it. The body stays uncompressed.
+            # [Stage 10: Multiple compression schemes]
+            # Advertise gzip when it is one of the client's codings. The body stays uncompressed.
             if accepts_gzip(headers.get("accept-encoding", "")):
                 response_headers["Content-Encoding"] = "gzip"
             response = HTTPResponse(200, body=body, headers=response_headers)
