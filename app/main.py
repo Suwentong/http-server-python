@@ -8,6 +8,13 @@ from pathlib import Path
 CRLF = "\r\n"
 
 
+def client_requests_close(headers: dict[str, str]) -> bool:
+    # [Stage 12: Persistent connections]
+    # HTTP/1.1 stays open unless the client lists "close" in the Connection header.
+    tokens = [part.strip().lower() for part in headers.get("connection", "").split(",")]
+    return "close" in tokens
+
+
 def accepts_gzip(accept_encoding: str) -> bool:
     # [Stage 10: Multiple compression schemes]
     # Accept-Encoding may be one coding or a comma-separated list, such as
@@ -56,108 +63,117 @@ class HTTPResponse:
 
 def handle_connection(conn: socket.socket, directory: Path | None = None):
     with conn:
-        data = bytearray()
-        while b"\r\n\r\n" not in data:
-            chunk = conn.recv(4096)
-            if not chunk:
-                return
-            data.extend(chunk)
-        # [Stage 2: Extract the URL path]
-        # Separate the headers from the body, then split the head into CRLF lines.
-        head, body = data.split(b"\r\n\r\n", 1)
-        lines = head.decode("iso-8859-1").split(CRLF)
-        # Request line: "GET /index.html HTTP/1.1" -> path = "/index.html".
-        # Stage 7 also uses the extracted method to identify POST requests.
-        method, path, _ = lines[0].split()
-        # [Stage 9: Accept-Encoding and Content-Encoding]
-        # Shared header parser: stores Accept-Encoding as headers["accept-encoding"].
-        # [Stage 4: Read a header — /user-agent]
-        # Also stores User-Agent as headers["user-agent"], trimming surrounding whitespace.
-        headers = {}
-        for line in lines[1:]:
-            name, separator, value = line.partition(":")
-            if separator:
-                headers[name.lower()] = value.strip(" \t")
-        # [Stage 7: Read a request body — POST /files/{filename}]
-        # Content-Length tells us how many body bytes to read; reject invalid lengths.
-        try:
-            content_length = int(headers.get("content-length", "0"))
-            if content_length < 0:
-                raise ValueError
-        except ValueError:
-            conn.sendall(bytes(HTTPResponse(400)))
-            return
-        # The initial receive may contain only part of the body; read the rest.
-        while len(body) < content_length:
-            chunk = conn.recv(min(4096, content_length - len(body)))
-            if not chunk:
+        # [Stage 12: Persistent connections]
+        # Bytes past the current request stay here for the next request on this socket.
+        pending = bytearray()
+        while True:
+            while b"\r\n\r\n" not in pending:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                pending.extend(chunk)
+            # [Stage 2: Extract the URL path]
+            # Separate the headers from the body, then split the head into CRLF lines.
+            head, rest = pending.split(b"\r\n\r\n", 1)
+            lines = head.decode("iso-8859-1").split(CRLF)
+            # Request line: "GET /index.html HTTP/1.1" -> path = "/index.html".
+            # Stage 7 also uses the extracted method to identify POST requests.
+            method, path, _ = lines[0].split()
+            # [Stage 9: Accept-Encoding and Content-Encoding]
+            # Shared header parser: stores Accept-Encoding as headers["accept-encoding"].
+            # [Stage 4: Read a header — /user-agent]
+            # Also stores User-Agent as headers["user-agent"], trimming surrounding whitespace.
+            headers = {}
+            for line in lines[1:]:
+                name, separator, value = line.partition(":")
+                if separator:
+                    headers[name.lower()] = value.strip(" \t")
+            # [Stage 7: Read a request body — POST /files/{filename}]
+            # Content-Length tells us how many body bytes to read; reject invalid lengths.
+            try:
+                content_length = int(headers.get("content-length", "0"))
+                if content_length < 0:
+                    raise ValueError
+            except ValueError:
                 conn.sendall(bytes(HTTPResponse(400)))
                 return
-            body.extend(chunk)
-        # Keep exactly the declared number of bytes for writing to the file.
-        body = bytes(body[:content_length])
-        # [Stage 2: Extract the URL path]
-        # The root path returns 200 OK; later stages add the routes below.
-        if path == "/":
-            response = HTTPResponse(200)
-        elif path.startswith("/echo/") or path == "/user-agent":
-            # [Stage 3: Respond with a body — /echo/{str}]
-            # The echo route extracts "abc" from "/echo/abc" using removeprefix.
-            # [Stage 4: Read a header — /user-agent]
-            # For /user-agent, use the parsed User-Agent value as the response body.
-            body = (
-                headers.get("user-agent", "")
-                if path == "/user-agent"
-                else path.removeprefix("/echo/")
-            )
-            # Stages 3 and 4 share this 200 response with the selected string as its body.
-            body_bytes = body.encode("utf-8")
-            response_headers = {
-                # Stages 3 and 4: identify plain text. Content-Length is set after compression.
-                "Content-Type": "text/plain",
-            }
-            # [Stage 9: Accept-Encoding and Content-Encoding]
-            # [Stage 10: Multiple compression schemes]
-            # [Stage 11: Gzip compression]
-            # Compress the body when gzip is one of the client's codings.
-            if accepts_gzip(headers.get("accept-encoding", "")):
-                body_bytes = gzip.compress(body_bytes)
-                response_headers["Content-Encoding"] = "gzip"
-            response_headers["Content-Length"] = str(len(body_bytes))
-            response = HTTPResponse(200, body=body_bytes, headers=response_headers)
-        elif path.startswith("/files/") and directory is not None:
-            # [Stage 6: Return a file — /files/{filename}]
-            # Resolve the requested filename under the directory supplied by --directory.
-            try:
-                file_path = (directory / path.removeprefix("/files/")).resolve()
-                # Keep file requests inside that directory.
-                if not file_path.is_relative_to(directory):
-                    response = HTTPResponse(404)
-                elif method == "POST":
-                    # [Stage 7: Read a request body — POST /files/{filename}]
-                    # Save the body to the resolved filename and return 201 Created.
-                    file_path.write_bytes(body)
-                    response = HTTPResponse(201)
-                else:
-                    # Stage 6: read the file as bytes and return 200 with its contents.
-                    body = file_path.read_bytes()
-                    response = HTTPResponse(
-                        200,
-                        body=body,
-                        headers={
-                            # Stage 6: binary content type and file size in bytes.
-                            "Content-Type": "application/octet-stream",
-                            "Content-Length": str(len(body)),
-                        },
-                    )
-            except (OSError, ValueError):
-                # Stage 6: a missing file (or another file access error) returns 404.
-                response = HTTPResponse(404)
-        else:
+            # The initial receive may contain only part of the body; read the rest.
+            while len(rest) < content_length:
+                chunk = conn.recv(min(4096, content_length - len(rest)))
+                if not chunk:
+                    conn.sendall(bytes(HTTPResponse(400)))
+                    return
+                rest.extend(chunk)
+            # Keep exactly the declared number of bytes for writing to the file.
+            # Any bytes after that belong to the next request on this connection.
+            body = bytes(rest[:content_length])
+            pending = rest[content_length:]
             # [Stage 2: Extract the URL path]
-            # Any path not matched by a supported route returns 404 Not Found.
-            response = HTTPResponse(404)
-        conn.sendall(bytes(response))
+            # The root path returns 200 OK; later stages add the routes below.
+            if path == "/":
+                response = HTTPResponse(200)
+            elif path.startswith("/echo/") or path == "/user-agent":
+                # [Stage 3: Respond with a body — /echo/{str}]
+                # The echo route extracts "abc" from "/echo/abc" using removeprefix.
+                # [Stage 4: Read a header — /user-agent]
+                # For /user-agent, use the parsed User-Agent value as the response body.
+                body = (
+                    headers.get("user-agent", "")
+                    if path == "/user-agent"
+                    else path.removeprefix("/echo/")
+                )
+                # Stages 3 and 4 share this 200 response with the selected string as its body.
+                body_bytes = body.encode("utf-8")
+                response_headers = {
+                    # Stages 3 and 4: identify plain text. Content-Length is set after compression.
+                    "Content-Type": "text/plain",
+                }
+                # [Stage 9: Accept-Encoding and Content-Encoding]
+                # [Stage 10: Multiple compression schemes]
+                # [Stage 11: Gzip compression]
+                # Compress the body when gzip is one of the client's codings.
+                if accepts_gzip(headers.get("accept-encoding", "")):
+                    body_bytes = gzip.compress(body_bytes)
+                    response_headers["Content-Encoding"] = "gzip"
+                response_headers["Content-Length"] = str(len(body_bytes))
+                response = HTTPResponse(200, body=body_bytes, headers=response_headers)
+            elif path.startswith("/files/") and directory is not None:
+                # [Stage 6: Return a file — /files/{filename}]
+                # Resolve the requested filename under the directory supplied by --directory.
+                try:
+                    file_path = (directory / path.removeprefix("/files/")).resolve()
+                    # Keep file requests inside that directory.
+                    if not file_path.is_relative_to(directory):
+                        response = HTTPResponse(404)
+                    elif method == "POST":
+                        # [Stage 7: Read a request body — POST /files/{filename}]
+                        # Save the body to the resolved filename and return 201 Created.
+                        file_path.write_bytes(body)
+                        response = HTTPResponse(201)
+                    else:
+                        # Stage 6: read the file as bytes and return 200 with its contents.
+                        body = file_path.read_bytes()
+                        response = HTTPResponse(
+                            200,
+                            body=body,
+                            headers={
+                                # Stage 6: binary content type and file size in bytes.
+                                "Content-Type": "application/octet-stream",
+                                "Content-Length": str(len(body)),
+                            },
+                        )
+                except (OSError, ValueError):
+                    # Stage 6: a missing file (or another file access error) returns 404.
+                    response = HTTPResponse(404)
+            else:
+                # [Stage 2: Extract the URL path]
+                # Any path not matched by a supported route returns 404 Not Found.
+                response = HTTPResponse(404)
+            conn.sendall(bytes(response))
+            # [Stage 12: Persistent connections]
+            # Leave the socket open for another request unless the client asked to close it.
+            if client_requests_close(headers):
+                return
 
 
 def main():
