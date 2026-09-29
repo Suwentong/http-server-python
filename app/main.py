@@ -1,4 +1,5 @@
 import argparse
+import gzip
 import socket
 # [Stage 5: Concurrent connections] Each connection runs in its own thread.
 import threading
@@ -48,7 +49,7 @@ class HTTPResponse:
         )
         # [Stage 3: Respond with a body — /echo/{str}]
         # Encode text as bytes and separate the headers from the body with a blank line.
-        # Stage 9 leaves the body uncompressed; UTF-8 encoding is not gzip.
+        # Stage 11 passes an already gzip-compressed body when Content-Encoding is gzip.
         body = self.body.encode("utf-8") if isinstance(self.body, str) else self.body
         return f"{status_line}{headers}{CRLF}".encode("utf-8") + body
 
@@ -110,17 +111,20 @@ def handle_connection(conn: socket.socket, directory: Path | None = None):
                 else path.removeprefix("/echo/")
             )
             # Stages 3 and 4 share this 200 response with the selected string as its body.
+            body_bytes = body.encode("utf-8")
             response_headers = {
-                # Stages 3 and 4: identify plain text and report its size in bytes.
+                # Stages 3 and 4: identify plain text. Content-Length is set after compression.
                 "Content-Type": "text/plain",
-                "Content-Length": str(len(body.encode("utf-8"))),
             }
             # [Stage 9: Accept-Encoding and Content-Encoding]
             # [Stage 10: Multiple compression schemes]
-            # Advertise gzip when it is one of the client's codings. The body stays uncompressed.
+            # [Stage 11: Gzip compression]
+            # Compress the body when gzip is one of the client's codings.
             if accepts_gzip(headers.get("accept-encoding", "")):
+                body_bytes = gzip.compress(body_bytes)
                 response_headers["Content-Encoding"] = "gzip"
-            response = HTTPResponse(200, body=body, headers=response_headers)
+            response_headers["Content-Length"] = str(len(body_bytes))
+            response = HTTPResponse(200, body=body_bytes, headers=response_headers)
         elif path.startswith("/files/") and directory is not None:
             # [Stage 6: Return a file — /files/{filename}]
             # Resolve the requested filename under the directory supplied by --directory.
