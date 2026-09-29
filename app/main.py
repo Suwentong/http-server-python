@@ -10,6 +10,7 @@ CRLF = "\r\n"
 
 def client_requests_close(headers: dict[str, str]) -> bool:
     # [Stage 12: Persistent connections]
+    # [Stage 14: Connection close]
     # HTTP/1.1 stays open unless the client lists "close" in the Connection header.
     tokens = [part.strip().lower() for part in headers.get("connection", "").split(",")]
     return "close" in tokens
@@ -64,7 +65,8 @@ class HTTPResponse:
 def handle_connection(conn: socket.socket, directory: Path | None = None):
     with conn:
         # [Stage 12: Persistent connections]
-        # Bytes past the current request stay here for the next request on this socket.
+        # [Stage 13: Concurrent persistent connections]
+        # This buffer belongs to one connection. Another client has its own thread and buffer.
         pending = bytearray()
         while True:
             while b"\r\n\r\n" not in pending:
@@ -169,9 +171,12 @@ def handle_connection(conn: socket.socket, directory: Path | None = None):
                 # [Stage 2: Extract the URL path]
                 # Any path not matched by a supported route returns 404 Not Found.
                 response = HTTPResponse(404)
-            conn.sendall(bytes(response))
             # [Stage 12: Persistent connections]
-            # Leave the socket open for another request unless the client asked to close it.
+            # [Stage 14: Connection close]
+            # Echo Connection: close, then close the socket after this response.
+            if client_requests_close(headers):
+                response.headers["Connection"] = "close"
+            conn.sendall(bytes(response))
             if client_requests_close(headers):
                 return
 
@@ -188,7 +193,8 @@ def main():
         while True:
             conn, _ = server_socket.accept()
             # [Stage 5: Concurrent connections]
-            # Start a worker so this loop can accept more clients while it handles a request.
+            # [Stage 13: Concurrent persistent connections]
+            # Each worker keeps its own socket open across requests, so clients do not block each other.
             threading.Thread(
                 target=handle_connection, args=(conn, directory), daemon=True
             ).start()
